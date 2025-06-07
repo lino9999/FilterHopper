@@ -1,0 +1,13 @@
+name: FilterHopper
+version: '1.0'
+main: com.Lino.filterHopper.FilterHopper
+api-version: '1.21'
+commands:
+  filterhopper:
+    description: FilterHopper command
+    usage: /filterhopper give <player> <amount>
+    permission: filterhopper.admin
+permissions:
+  filterhopper.admin:
+    description: Allows use of filterhopper commands
+    default: op
