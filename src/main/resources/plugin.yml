@@ -4,10 +4,21 @@ main: com.Lino.filterHopper.FilterHopper
 api-version: '1.21'
 commands:
   filterhopper:
-    description: FilterHopper command
-    usage: /filterhopper give <player> <amount>
+    description: FilterHopper main command
+    usage: /<command> give <player> <amount>
     permission: filterhopper.admin
+    aliases: [fh, fhopper]
+
 permissions:
   filterhopper.admin:
-    description: Allows use of filterhopper commands
+    description: Allows use of filterhopper admin commands
     default: op
+  filterhopper.use:
+    description: Allows players to use filter hoppers
+    default: true
+  filterhopper.place:
+    description: Allows players to place filter hoppers
+    default: true
+  filterhopper.break:
+    description: Allows players to break filter hoppers
+    default: true

@@ -7,8 +7,11 @@ import org.bukkit.block.Block;
 import org.bukkit.block.Hopper;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandSender;
+import org.bukkit.configuration.file.FileConfiguration;
+import org.bukkit.configuration.file.YamlConfiguration;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
+import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
 import org.bukkit.event.block.Action;
 import org.bukkit.event.block.BlockBreakEvent;
@@ -23,293 +26,499 @@ import org.bukkit.inventory.meta.ItemMeta;
 import org.bukkit.persistence.PersistentDataContainer;
 import org.bukkit.persistence.PersistentDataType;
 import org.bukkit.plugin.java.JavaPlugin;
+import org.bukkit.scheduler.BukkitTask;
 
+import java.io.File;
+import java.io.IOException;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 
 public class FilterHopper extends JavaPlugin implements Listener {
 
     private NamespacedKey filterKey;
-    private NamespacedKey filterDataKey;
-    private Map<Location, List<FilterItem>> hopperFilters = new HashMap<>();
-    private Map<UUID, Location> openGuis = new HashMap<>();
+    private final Map<Location, Set<FilterItem>> hopperFilters = new ConcurrentHashMap<>();
+    private final Map<UUID, Location> openGuis = new ConcurrentHashMap<>();
+    private final Map<Location, Long> lastProcessTime = new ConcurrentHashMap<>();
+
+    private File dataFile;
+    private FileConfiguration dataConfig;
+    private BukkitTask saveTask;
+
+    // Cache per ottimizzare la creazione degli item
+    private ItemStack cachedFilterHopper;
+
+    // Configurazione
+    private FileConfiguration config;
+    private String filterHopperName;
+    private List<String> filterHopperLore;
+    private String filterGuiTitle;
+    private int processRateLimit;
+    private int maxFilterItems;
 
     @Override
     public void onEnable() {
+        saveDefaultConfig();
+        loadConfiguration();
+
         filterKey = new NamespacedKey(this, "filter_hopper");
-        filterDataKey = new NamespacedKey(this, "filter_data");
         getServer().getPluginManager().registerEvents(this, this);
+
+        setupDataFile();
+        loadData();
+
+        createCachedFilterHopper();
+
+        long saveInterval = config.getLong("save-interval", 300) * 20L;
+        saveTask = Bukkit.getScheduler().runTaskTimerAsynchronously(this, this::saveData, saveInterval, saveInterval);
+
+        getLogger().info("FilterHopper v2.0 enabled successfully!");
+    }
+
+    private void loadConfiguration() {
+        config = getConfig();
+
+        filterHopperName = colorize(config.getString("filter-hopper.name", "&6Filter Hopper"));
+        filterHopperLore = new ArrayList<>();
+        for (String line : config.getStringList("filter-hopper.lore")) {
+            filterHopperLore.add(colorize(line));
+        }
+        filterGuiTitle = colorize(config.getString("messages.filter-gui-title", "Filter: select items to filter"));
+        processRateLimit = config.getInt("process-rate-limit", 50);
+        maxFilterItems = Math.max(1, Math.min(9, config.getInt("max-filter-items", 9)));
+    }
+
+    private String colorize(String text) {
+        return text.replace('&', '§');
+    }
+
+    @Override
+    public void onDisable() {
+        if (saveTask != null) {
+            saveTask.cancel();
+        }
+        saveData();
+        getLogger().info("FilterHopper v2.0 disabled - data saved successfully!");
+    }
+
+    private void setupDataFile() {
+        dataFile = new File(getDataFolder(), "filters.yml");
+        if (!dataFile.exists()) {
+            dataFile.getParentFile().mkdirs();
+        }
+        dataConfig = YamlConfiguration.loadConfiguration(dataFile);
+    }
+
+    private void createCachedFilterHopper() {
+        cachedFilterHopper = new ItemStack(Material.HOPPER);
+        ItemMeta meta = cachedFilterHopper.getItemMeta();
+        if (meta != null) {
+            meta.setDisplayName(filterHopperName);
+            meta.setLore(filterHopperLore);
+            meta.getPersistentDataContainer().set(filterKey, PersistentDataType.BYTE, (byte) 1);
+            cachedFilterHopper.setItemMeta(meta);
+        }
+    }
+
+    private ItemStack createFilterHopper(int amount) {
+        ItemStack item = cachedFilterHopper.clone();
+        item.setAmount(amount);
+        return item;
     }
 
     @Override
     public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
-        if (command.getName().equalsIgnoreCase("filterhopper")) {
-            if (args.length >= 3 && args[0].equalsIgnoreCase("give")) {
-                Player target = Bukkit.getPlayer(args[1]);
-                if (target == null) {
-                    sender.sendMessage("Player not found!");
-                    return true;
-                }
+        if (!command.getName().equalsIgnoreCase("filterhopper")) {
+            return false;
+        }
 
-                int amount = 1;
-                try {
-                    amount = Integer.parseInt(args[2]);
-                    amount = Math.max(1, Math.min(64, amount));
-                } catch (NumberFormatException e) {
-                    sender.sendMessage("Invalid amount!");
-                    return true;
-                }
+        if (!sender.hasPermission("filterhopper.admin")) {
+            sender.sendMessage(colorize(config.getString("messages.no-permission", "&cYou don't have permission!")));
+            return true;
+        }
 
-                ItemStack filterHopper = new ItemStack(Material.HOPPER, amount);
-                ItemMeta meta = filterHopper.getItemMeta();
-                meta.setDisplayName("§6Filter Hopper");
-                meta.setLore(Arrays.asList("§7Right-click to set filter"));
-                PersistentDataContainer container = meta.getPersistentDataContainer();
-                container.set(filterKey, PersistentDataType.BYTE, (byte) 1);
-                filterHopper.setItemMeta(meta);
-
-                target.getInventory().addItem(filterHopper);
-                sender.sendMessage("Given " + amount + " Filter Hopper(s) to " + target.getName());
+        if (args.length >= 3 && args[0].equalsIgnoreCase("give")) {
+            Player target = Bukkit.getPlayer(args[1]);
+            if (target == null) {
+                sender.sendMessage(colorize(config.getString("messages.player-not-found", "&cPlayer not found!")));
                 return true;
             }
-            sender.sendMessage("Usage: /filterhopper give <player> <amount>");
+
+            int amount = 1;
+            try {
+                amount = Math.max(1, Math.min(64, Integer.parseInt(args[2])));
+            } catch (NumberFormatException e) {
+                sender.sendMessage(colorize(config.getString("messages.invalid-amount", "&cInvalid amount!")));
+                return true;
+            }
+
+            target.getInventory().addItem(createFilterHopper(amount));
+            String message = config.getString("messages.give-success", "&aGiven %amount% Filter Hopper(s) to %player%")
+                    .replace("%amount%", String.valueOf(amount))
+                    .replace("%player%", target.getName());
+            sender.sendMessage(colorize(message));
+            return true;
         }
+
+        sender.sendMessage("§eUsage: /filterhopper give <player> <amount>");
         return false;
     }
 
-    @EventHandler
+    @EventHandler(priority = EventPriority.HIGH)
     public void onBlockPlace(BlockPlaceEvent event) {
+        if (event.isCancelled()) return;
+
         ItemStack item = event.getItemInHand();
-        if (item.getType() == Material.HOPPER && item.hasItemMeta()) {
-            ItemMeta meta = item.getItemMeta();
-            PersistentDataContainer container = meta.getPersistentDataContainer();
-            if (container.has(filterKey, PersistentDataType.BYTE)) {
-                Block block = event.getBlock();
-                if (block.getState() instanceof Hopper) {
-                    Hopper hopper = (Hopper) block.getState();
-                    PersistentDataContainer hopperContainer = hopper.getPersistentDataContainer();
-                    hopperContainer.set(filterKey, PersistentDataType.BYTE, (byte) 1);
-                    hopper.update();
-                    hopperFilters.put(new Location(block.getLocation()), new ArrayList<>());
-                }
-            }
-        }
-    }
+        if (item.getType() != Material.HOPPER || !item.hasItemMeta()) return;
 
-    @EventHandler
-    public void onBlockBreak(BlockBreakEvent event) {
+        ItemMeta meta = item.getItemMeta();
+        if (meta == null || !meta.getPersistentDataContainer().has(filterKey, PersistentDataType.BYTE)) return;
+
+        Player player = event.getPlayer();
+        if (!player.hasPermission("filterhopper.place")) {
+            event.setCancelled(true);
+            player.sendMessage(colorize(config.getString("messages.no-permission", "&cYou don't have permission!")));
+            return;
+        }
+
         Block block = event.getBlock();
-        if (block.getType() == Material.HOPPER && block.getState() instanceof Hopper) {
-            Hopper hopper = (Hopper) block.getState();
-            PersistentDataContainer container = hopper.getPersistentDataContainer();
-            if (container.has(filterKey, PersistentDataType.BYTE)) {
-                event.setDropItems(false);
-                ItemStack filterHopper = new ItemStack(Material.HOPPER);
-                ItemMeta meta = filterHopper.getItemMeta();
-                meta.setDisplayName("§6Filter Hopper");
-                meta.setLore(Arrays.asList("§7Right-click to set filter"));
-                PersistentDataContainer itemContainer = meta.getPersistentDataContainer();
-                itemContainer.set(filterKey, PersistentDataType.BYTE, (byte) 1);
-                filterHopper.setItemMeta(meta);
-                block.getWorld().dropItemNaturally(block.getLocation(), filterHopper);
-                hopperFilters.remove(new Location(block.getLocation()));
-            }
-        }
+        if (!(block.getState() instanceof Hopper)) return;
+
+        Hopper hopper = (Hopper) block.getState();
+        hopper.getPersistentDataContainer().set(filterKey, PersistentDataType.BYTE, (byte) 1);
+        hopper.update();
+
+        Location loc = new Location(block.getLocation());
+        hopperFilters.put(loc, ConcurrentHashMap.newKeySet());
     }
 
-    @EventHandler
-    public void onPlayerInteract(PlayerInteractEvent event) {
-        if (event.getAction() == Action.RIGHT_CLICK_BLOCK) {
-            Block block = event.getClickedBlock();
-            Player player = event.getPlayer();
+    @EventHandler(priority = EventPriority.HIGH)
+    public void onBlockBreak(BlockBreakEvent event) {
+        if (event.isCancelled()) return;
 
-            if (player.getInventory().getItemInMainHand().getType() == Material.HOPPER ||
-                    player.getInventory().getItemInOffHand().getType() == Material.HOPPER) {
-                return;
-            }
+        Block block = event.getBlock();
+        if (block.getType() != Material.HOPPER || !(block.getState() instanceof Hopper)) return;
 
-            if (block != null && block.getType() == Material.HOPPER && block.getState() instanceof Hopper) {
-                Hopper hopper = (Hopper) block.getState();
-                PersistentDataContainer container = hopper.getPersistentDataContainer();
-                if (container.has(filterKey, PersistentDataType.BYTE)) {
-                    event.setCancelled(true);
+        Hopper hopper = (Hopper) block.getState();
+        if (!hopper.getPersistentDataContainer().has(filterKey, PersistentDataType.BYTE)) return;
 
-                    Inventory gui = Bukkit.createInventory(null, 9, "Filter: select items to filter from your inventory");
-                    Location loc = new Location(block.getLocation());
-                    List<FilterItem> filter = hopperFilters.getOrDefault(loc, new ArrayList<>());
-
-                    for (FilterItem filterItem : filter) {
-                        gui.addItem(filterItem.toItemStack());
-                    }
-
-                    player.openInventory(gui);
-                    openGuis.put(player.getUniqueId(), loc);
-                }
-            }
+        Player player = event.getPlayer();
+        if (!player.hasPermission("filterhopper.break")) {
+            event.setCancelled(true);
+            player.sendMessage(colorize(config.getString("messages.no-permission", "&cYou don't have permission!")));
+            return;
         }
+
+        event.setDropItems(false);
+        block.getWorld().dropItemNaturally(block.getLocation(), createFilterHopper(1));
+
+        Location loc = new Location(block.getLocation());
+        hopperFilters.remove(loc);
+        lastProcessTime.remove(loc);
+    }
+
+    @EventHandler(priority = EventPriority.HIGH)
+    public void onPlayerInteract(PlayerInteractEvent event) {
+        if (event.getAction() != Action.RIGHT_CLICK_BLOCK) return;
+
+        Player player = event.getPlayer();
+        if (!player.hasPermission("filterhopper.use")) return;
+
+        ItemStack hand = player.getInventory().getItemInMainHand();
+        if (hand.getType() == Material.HOPPER || player.getInventory().getItemInOffHand().getType() == Material.HOPPER) {
+            return;
+        }
+
+        Block block = event.getClickedBlock();
+        if (block == null || block.getType() != Material.HOPPER) return;
+
+        if (!(block.getState() instanceof Hopper)) return;
+
+        Hopper hopper = (Hopper) block.getState();
+        if (!hopper.getPersistentDataContainer().has(filterKey, PersistentDataType.BYTE)) return;
+
+        event.setCancelled(true);
+
+        Inventory gui = Bukkit.createInventory(null, maxFilterItems, filterGuiTitle);
+        Location loc = new Location(block.getLocation());
+        Set<FilterItem> filter = hopperFilters.getOrDefault(loc, ConcurrentHashMap.newKeySet());
+
+        for (FilterItem filterItem : filter) {
+            gui.addItem(filterItem.toItemStack());
+        }
+
+        player.openInventory(gui);
+        openGuis.put(player.getUniqueId(), loc);
     }
 
     @EventHandler
     public void onInventoryClick(InventoryClickEvent event) {
         if (!(event.getWhoClicked() instanceof Player)) return;
+
         Player player = (Player) event.getWhoClicked();
+        Location loc = openGuis.get(player.getUniqueId());
+        if (loc == null) return;
 
-        if (openGuis.containsKey(player.getUniqueId())) {
-            if (event.getView().getTitle().equals("Filter: select items to filter from your inventory")) {
-                event.setCancelled(true);
+        if (!event.getView().getTitle().equals(filterGuiTitle)) return;
 
-                if (event.getClickedInventory() == player.getInventory()) {
-                    ItemStack clicked = event.getCurrentItem();
-                    if (clicked != null && clicked.getType() != Material.AIR) {
-                        Inventory gui = event.getView().getTopInventory();
-                        boolean found = false;
+        event.setCancelled(true);
 
-                        for (int i = 0; i < gui.getSize(); i++) {
-                            ItemStack item = gui.getItem(i);
-                            if (item != null && isSameFilterItem(item, clicked)) {
-                                found = true;
-                                break;
-                            }
-                        }
+        if (event.getClickedInventory() == player.getInventory()) {
+            ItemStack clicked = event.getCurrentItem();
+            if (clicked == null || clicked.getType() == Material.AIR) return;
 
-                        if (!found) {
-                            for (int i = 0; i < gui.getSize(); i++) {
-                                if (gui.getItem(i) == null) {
-                                    gui.setItem(i, clicked.clone());
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                } else if (event.getClickedInventory() == event.getView().getTopInventory()) {
-                    event.getView().getTopInventory().setItem(event.getSlot(), null);
+            Inventory gui = event.getView().getTopInventory();
+            FilterItem filterItem = new FilterItem(clicked);
+
+            // Controlla se l'item è già presente
+            for (int i = 0; i < gui.getSize(); i++) {
+                ItemStack item = gui.getItem(i);
+                if (item != null && filterItem.isSimilar(item)) {
+                    return;
                 }
             }
+
+            // Aggiungi l'item al primo slot vuoto
+            for (int i = 0; i < gui.getSize(); i++) {
+                if (gui.getItem(i) == null) {
+                    gui.setItem(i, clicked.clone());
+                    break;
+                }
+            }
+        } else if (event.getClickedInventory() == event.getView().getTopInventory()) {
+            event.getView().getTopInventory().setItem(event.getSlot(), null);
         }
     }
 
     @EventHandler
     public void onInventoryClose(InventoryCloseEvent event) {
         if (!(event.getPlayer() instanceof Player)) return;
+
         Player player = (Player) event.getPlayer();
+        Location loc = openGuis.remove(player.getUniqueId());
+        if (loc == null) return;
 
-        if (openGuis.containsKey(player.getUniqueId())) {
-            Location loc = openGuis.remove(player.getUniqueId());
-            List<FilterItem> filter = new ArrayList<>();
-
-            for (ItemStack item : event.getInventory().getContents()) {
-                if (item != null && item.getType() != Material.AIR) {
-                    filter.add(new FilterItem(item));
-                }
+        Set<FilterItem> filter = ConcurrentHashMap.newKeySet();
+        for (ItemStack item : event.getInventory().getContents()) {
+            if (item != null && item.getType() != Material.AIR) {
+                filter.add(new FilterItem(item));
             }
+        }
 
+        if (filter.isEmpty()) {
+            hopperFilters.remove(loc);
+        } else {
             hopperFilters.put(loc, filter);
         }
     }
 
-    @EventHandler
+    @EventHandler(priority = EventPriority.LOW)
     public void onInventoryMoveItem(InventoryMoveItemEvent event) {
-        // Verifica se la destinazione è un Filter Hopper
-        if (event.getDestination().getHolder() instanceof Hopper) {
-            Block block = event.getDestination().getLocation().getBlock();
-            if (block.getState() instanceof Hopper) {
-                Hopper hopper = (Hopper) block.getState();
-                PersistentDataContainer container = hopper.getPersistentDataContainer();
-                if (container.has(filterKey, PersistentDataType.BYTE)) {
-                    Location loc = new Location(block.getLocation());
-                    List<FilterItem> filter = hopperFilters.getOrDefault(loc, new ArrayList<>());
+        if (event.isCancelled()) return;
 
-                    if (!filter.isEmpty()) {
-                        boolean allowed = false;
-                        for (FilterItem filterItem : filter) {
-                            if (filterItem.matches(event.getItem())) {
-                                allowed = true;
-                                break;
-                            }
-                        }
+        if (!(event.getDestination().getHolder() instanceof Hopper)) return;
 
-                        if (!allowed) {
-                            // Cancella l'evento per impedire il movimento dell'item
-                            event.setCancelled(true);
+        Block block = event.getDestination().getLocation().getBlock();
+        if (!(block.getState() instanceof Hopper)) return;
 
-                            // Crea un task per rimuovere l'item dall'inventario di origine
-                            Bukkit.getScheduler().runTask(this, () -> {
-                                Inventory source = event.getSource();
-                                ItemStack itemToRemove = event.getItem();
+        Hopper hopper = (Hopper) block.getState();
+        if (!hopper.getPersistentDataContainer().has(filterKey, PersistentDataType.BYTE)) return;
 
-                                // Cerca e rimuovi l'item dall'inventario di origine
-                                for (int i = 0; i < source.getSize(); i++) {
-                                    ItemStack slot = source.getItem(i);
-                                    if (slot != null && slot.isSimilar(itemToRemove)) {
-                                        if (slot.getAmount() > itemToRemove.getAmount()) {
-                                            slot.setAmount(slot.getAmount() - itemToRemove.getAmount());
-                                        } else {
-                                            source.setItem(i, null);
-                                        }
-                                        break;
-                                    }
-                                }
-                            });
-                        }
-                    }
+        Location loc = new Location(block.getLocation());
+
+        // Rate limiting per evitare processing eccessivo
+        Long lastTime = lastProcessTime.get(loc);
+        long currentTime = System.currentTimeMillis();
+        if (lastTime != null && currentTime - lastTime < processRateLimit) {
+            return;
+        }
+        lastProcessTime.put(loc, currentTime);
+
+        Set<FilterItem> filter = hopperFilters.get(loc);
+        if (filter == null || filter.isEmpty()) return;
+
+        ItemStack movingItem = event.getItem();
+        boolean allowed = false;
+
+        for (FilterItem filterItem : filter) {
+            if (filterItem.matches(movingItem)) {
+                allowed = true;
+                break;
+            }
+        }
+
+        if (!allowed) {
+            event.setCancelled(true);
+
+            if (config.getBoolean("debug", false)) {
+                getLogger().info("Blocked item " + movingItem.getType() + " from filter hopper at " + loc);
+            }
+
+            Bukkit.getScheduler().runTask(this, () -> {
+                Inventory source = event.getSource();
+                removeItemFromInventory(source, movingItem);
+            });
+        }
+    }
+
+    private void removeItemFromInventory(Inventory inventory, ItemStack itemToRemove) {
+        ItemStack[] contents = inventory.getContents();
+        int remaining = itemToRemove.getAmount();
+
+        for (int i = 0; i < contents.length && remaining > 0; i++) {
+            ItemStack slot = contents[i];
+            if (slot != null && slot.isSimilar(itemToRemove)) {
+                int amount = slot.getAmount();
+                if (amount > remaining) {
+                    slot.setAmount(amount - remaining);
+                    remaining = 0;
+                } else {
+                    inventory.setItem(i, null);
+                    remaining -= amount;
                 }
             }
         }
     }
 
-    private boolean isSameFilterItem(ItemStack item1, ItemStack item2) {
-        if (item1.getType() != item2.getType()) return false;
+    private void loadData() {
+        if (!dataConfig.contains("filters")) return;
 
-        String name1 = item1.hasItemMeta() && item1.getItemMeta().hasDisplayName() ?
-                item1.getItemMeta().getDisplayName() : null;
-        String name2 = item2.hasItemMeta() && item2.getItemMeta().hasDisplayName() ?
-                item2.getItemMeta().getDisplayName() : null;
+        for (String key : dataConfig.getConfigurationSection("filters").getKeys(false)) {
+            try {
+                String[] parts = key.split(",");
+                Location loc = new Location(
+                        parts[0],
+                        Integer.parseInt(parts[1]),
+                        Integer.parseInt(parts[2]),
+                        Integer.parseInt(parts[3])
+                );
 
-        if (name1 == null && name2 == null) return true;
-        if (name1 == null || name2 == null) return false;
-        return name1.equals(name2);
+                Set<FilterItem> items = ConcurrentHashMap.newKeySet();
+                List<String> filterData = dataConfig.getStringList("filters." + key);
+
+                for (String data : filterData) {
+                    items.add(FilterItem.fromString(data));
+                }
+
+                hopperFilters.put(loc, items);
+            } catch (Exception e) {
+                getLogger().warning("Failed to load filter at " + key + ": " + e.getMessage());
+            }
+        }
     }
 
-    class FilterItem {
+    private void saveData() {
+        dataConfig = new YamlConfiguration();
+
+        for (Map.Entry<Location, Set<FilterItem>> entry : hopperFilters.entrySet()) {
+            Location loc = entry.getKey();
+            String key = "filters." + loc.toString();
+
+            List<String> filterData = new ArrayList<>();
+            for (FilterItem item : entry.getValue()) {
+                filterData.add(item.toString());
+            }
+
+            dataConfig.set(key, filterData);
+        }
+
+        try {
+            dataConfig.save(dataFile);
+        } catch (IOException e) {
+            getLogger().severe("Failed to save filter data: " + e.getMessage());
+        }
+    }
+
+    static class FilterItem {
         private final Material material;
         private final String displayName;
+        private final int hashCode;
 
         FilterItem(ItemStack item) {
             this.material = item.getType();
             this.displayName = item.hasItemMeta() && item.getItemMeta().hasDisplayName() ?
                     item.getItemMeta().getDisplayName() : null;
+            this.hashCode = Objects.hash(material, displayName);
+        }
+
+        private FilterItem(Material material, String displayName) {
+            this.material = material;
+            this.displayName = displayName;
+            this.hashCode = Objects.hash(material, displayName);
         }
 
         boolean matches(ItemStack item) {
             if (item.getType() != material) return false;
 
-            String itemName = item.hasItemMeta() && item.getItemMeta().hasDisplayName() ?
-                    item.getItemMeta().getDisplayName() : null;
+            if (displayName == null) {
+                return !item.hasItemMeta() || !item.getItemMeta().hasDisplayName();
+            }
 
-            if (displayName == null && itemName == null) return true;
-            if (displayName == null || itemName == null) return false;
-            return displayName.equals(itemName);
+            return item.hasItemMeta() &&
+                    item.getItemMeta().hasDisplayName() &&
+                    displayName.equals(item.getItemMeta().getDisplayName());
+        }
+
+        boolean isSimilar(ItemStack item) {
+            return matches(item);
         }
 
         ItemStack toItemStack() {
             ItemStack item = new ItemStack(material);
             if (displayName != null) {
                 ItemMeta meta = item.getItemMeta();
-                meta.setDisplayName(displayName);
-                item.setItemMeta(meta);
+                if (meta != null) {
+                    meta.setDisplayName(displayName);
+                    item.setItemMeta(meta);
+                }
             }
             return item;
         }
+
+        @Override
+        public String toString() {
+            return material.name() + ":" + (displayName != null ? displayName : "null");
+        }
+
+        static FilterItem fromString(String data) {
+            String[] parts = data.split(":", 2);
+            Material mat = Material.valueOf(parts[0]);
+            String name = parts[1].equals("null") ? null : parts[1];
+            return new FilterItem(mat, name);
+        }
+
+        @Override
+        public boolean equals(Object obj) {
+            if (this == obj) return true;
+            if (!(obj instanceof FilterItem)) return false;
+            FilterItem other = (FilterItem) obj;
+            return material == other.material && Objects.equals(displayName, other.displayName);
+        }
+
+        @Override
+        public int hashCode() {
+            return hashCode;
+        }
     }
 
-    class Location {
-        private final int x, y, z;
+    static class Location {
         private final String world;
+        private final int x, y, z;
+        private final int hashCode;
 
         Location(org.bukkit.Location loc) {
+            this.world = loc.getWorld().getName();
             this.x = loc.getBlockX();
             this.y = loc.getBlockY();
             this.z = loc.getBlockZ();
-            this.world = loc.getWorld().getName();
+            this.hashCode = Objects.hash(world, x, y, z);
+        }
+
+        Location(String world, int x, int y, int z) {
+            this.world = world;
+            this.x = x;
+            this.y = y;
+            this.z = z;
+            this.hashCode = Objects.hash(world, x, y, z);
         }
 
         @Override
@@ -322,7 +531,12 @@ public class FilterHopper extends JavaPlugin implements Listener {
 
         @Override
         public int hashCode() {
-            return Objects.hash(x, y, z, world);
+            return hashCode;
+        }
+
+        @Override
+        public String toString() {
+            return world + "," + x + "," + y + "," + z;
         }
     }
 }
