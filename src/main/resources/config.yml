@@ -1,0 +1,31 @@
+# FilterHopper Configuration
+# Version: 2.0
+
+# Save interval in seconds (default: 300 = 5 minutes)
+save-interval: 300
+
+# Enable debug messages
+debug: false
+
+# Rate limit for hopper processing in milliseconds
+# Lower values = faster processing but more CPU usage
+process-rate-limit: 50
+
+# Maximum items per filter (1-9)
+max-filter-items: 9
+
+# Messages
+messages:
+  player-not-found: "&cPlayer not found!"
+  invalid-amount: "&cInvalid amount!"
+  give-success: "&aGiven %amount% Filter Hopper(s) to %player%"
+  no-permission: "&cYou don't have permission to use this command!"
+  filter-gui-title: "Filter: select items to filter"
+
+# Item display
+filter-hopper:
+  name: "&6Filter Hopper"
+  lore:
+    - "&7Right-click to set filter"
+    - "&7Filters items passing through"
+    - "&7Non-matching items are voided"
