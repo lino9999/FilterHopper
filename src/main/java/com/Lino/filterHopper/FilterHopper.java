@@ -208,6 +208,7 @@ public class FilterHopper extends JavaPlugin implements Listener {
 
     @EventHandler
     public void onInventoryMoveItem(InventoryMoveItemEvent event) {
+        // Verifica se la destinazione è un Filter Hopper
         if (event.getDestination().getHolder() instanceof Hopper) {
             Block block = event.getDestination().getLocation().getBlock();
             if (block.getState() instanceof Hopper) {
@@ -227,8 +228,27 @@ public class FilterHopper extends JavaPlugin implements Listener {
                         }
 
                         if (!allowed) {
+                            // Cancella l'evento per impedire il movimento dell'item
                             event.setCancelled(true);
-                            event.getItem().setAmount(0);
+
+                            // Crea un task per rimuovere l'item dall'inventario di origine
+                            Bukkit.getScheduler().runTask(this, () -> {
+                                Inventory source = event.getSource();
+                                ItemStack itemToRemove = event.getItem();
+
+                                // Cerca e rimuovi l'item dall'inventario di origine
+                                for (int i = 0; i < source.getSize(); i++) {
+                                    ItemStack slot = source.getItem(i);
+                                    if (slot != null && slot.isSimilar(itemToRemove)) {
+                                        if (slot.getAmount() > itemToRemove.getAmount()) {
+                                            slot.setAmount(slot.getAmount() - itemToRemove.getAmount());
+                                        } else {
+                                            source.setItem(i, null);
+                                        }
+                                        break;
+                                    }
+                                }
+                            });
                         }
                     }
                 }
